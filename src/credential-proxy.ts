@@ -13,6 +13,9 @@
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
@@ -21,6 +24,23 @@ export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
   authMode: AuthMode;
+}
+
+/**
+ * Read the live OAuth access token from ~/.claude/.credentials.json.
+ * Claude Code refreshes this automatically; reading it fresh on each
+ * auth request ensures we never use a stale token.
+ */
+function readLiveOAuthToken(): string | undefined {
+  try {
+    const credPath = join(homedir(), '.claude', '.credentials.json');
+    const raw = readFileSync(credPath, 'utf-8');
+    const creds = JSON.parse(raw);
+    const token = creds?.claudeAiOauth?.accessToken;
+    return typeof token === 'string' && token ? token : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function startCredentialProxy(
@@ -35,7 +55,8 @@ export function startCredentialProxy(
   ]);
 
   const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
-  const oauthToken =
+  // Static fallback token from .env (used only if live credentials unavailable)
+  const staticOauthToken =
     secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
 
   const upstreamUrl = new URL(
@@ -72,6 +93,9 @@ export function startCredentialProxy(
           // (exchange request + auth probes). Post-exchange requests use
           // x-api-key only, so they pass through without token injection.
           if (headers['authorization']) {
+            // Read the live token fresh on every auth request so we always
+            // use the current token even after Claude Code refreshes it.
+            const oauthToken = readLiveOAuthToken() || staticOauthToken;
             delete headers['authorization'];
             if (oauthToken) {
               headers['authorization'] = `Bearer ${oauthToken}`;
