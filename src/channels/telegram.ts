@@ -47,7 +47,12 @@ export class TelegramChannel implements Channel {
     return map[mime] || 'audio';
   }
 
-  private saveAudio(group: RegisteredGroup, messageId: string, buffer: Buffer, ext: string): void {
+  private saveAudio(
+    group: RegisteredGroup,
+    messageId: string,
+    buffer: Buffer,
+    ext: string,
+  ): void {
     const audioDir = path.join(GROUPS_DIR, group.folder, 'audio');
     fs.mkdirSync(audioDir, { recursive: true });
     fs.writeFileSync(path.join(audioDir, `${messageId}.${ext}`), buffer);
@@ -251,7 +256,12 @@ export class TelegramChannel implements Channel {
               })
               .on('error', reject);
           });
-          this.saveAudio(group, ctx.message.message_id.toString(), buffer, 'ogg');
+          this.saveAudio(
+            group,
+            ctx.message.message_id.toString(),
+            buffer,
+            'ogg',
+          );
           const transcript = await transcribeAudio(buffer, 'audio/ogg');
           if (transcript) content = `[Voice: ${transcript}]`;
         }
@@ -280,9 +290,16 @@ export class TelegramChannel implements Channel {
         ctx.from?.username ||
         ctx.from?.id?.toString() ||
         'Unknown';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
 
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
 
       let content = '[Audio]';
       try {

@@ -169,6 +169,7 @@ Main has read-only access to the project and read-write access to its group fold
 | `/workspace/project` | Project root | read-only |
 | `/workspace/group` | `groups/main/` | read-write |
 | `/workspace/extra/myGTDBoT` | `/home/venkat/myGTDBoT` | read-write |
+| `/workspace/extra/obsidian-vault` | `/home/venkat/obsidian-vault` | read-write |
 
 Key paths inside the container:
 - `/workspace/project/store/messages.db` - SQLite database
