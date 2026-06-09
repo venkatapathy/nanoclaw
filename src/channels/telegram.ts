@@ -1,8 +1,12 @@
+import fs from 'fs';
+import https from 'https';
+import path from 'path';
 import { Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { transcribeAudio } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -29,7 +33,50 @@ export class TelegramChannel implements Channel {
     this.opts = opts;
   }
 
+  private mimeToExt(mime: string): string {
+    const map: Record<string, string> = {
+      'audio/ogg': 'ogg',
+      'audio/mpeg': 'mp3',
+      'audio/mp3': 'mp3',
+      'audio/mp4': 'm4a',
+      'audio/m4a': 'm4a',
+      'audio/wav': 'wav',
+      'audio/x-wav': 'wav',
+      'audio/webm': 'webm',
+    };
+    return map[mime] || 'audio';
+  }
+
+  private saveAudio(group: RegisteredGroup, messageId: string, buffer: Buffer, ext: string): void {
+    const audioDir = path.join(GROUPS_DIR, group.folder, 'audio');
+    fs.mkdirSync(audioDir, { recursive: true });
+    fs.writeFileSync(path.join(audioDir, `${messageId}.${ext}`), buffer);
+  }
+
+  private cleanupOldAudio(): void {
+    const cutoffMs = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    try {
+      const entries = fs.readdirSync(GROUPS_DIR, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const audioDir = path.join(GROUPS_DIR, entry.name, 'audio');
+        if (!fs.existsSync(audioDir)) continue;
+        for (const file of fs.readdirSync(audioDir)) {
+          const filePath = path.join(audioDir, file);
+          if (now - fs.statSync(filePath).mtimeMs > cutoffMs) {
+            fs.unlinkSync(filePath);
+            logger.info({ filePath }, 'Deleted audio file older than 30 days');
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Audio cleanup failed');
+    }
+  }
+
   async connect(): Promise<void> {
+    this.cleanupOldAudio();
     this.bot = new Bot(this.botToken);
 
     // Command to get chat ID (useful for registration)
@@ -167,8 +214,111 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      let content = '[Voice message]';
+      try {
+        const fileInfo = await ctx.api.getFile(ctx.message.voice.file_id);
+        if (fileInfo.file_path) {
+          const url = `https://api.telegram.org/file/bot${this.botToken}/${fileInfo.file_path}`;
+          const buffer = await new Promise<Buffer>((resolve, reject) => {
+            https
+              .get(url, (res) => {
+                const chunks: Buffer[] = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+                res.on('error', reject);
+              })
+              .on('error', reject);
+          });
+          this.saveAudio(group, ctx.message.message_id.toString(), buffer, 'ogg');
+          const transcript = await transcribeAudio(buffer, 'audio/ogg');
+          if (transcript) content = `[Voice: ${transcript}]`;
+        }
+      } catch (err: any) {
+        logger.error({ err: err.message }, 'Failed to download voice file');
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
+    this.bot.on('message:audio', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+
+      let content = '[Audio]';
+      try {
+        const fileInfo = await ctx.api.getFile(ctx.message.audio.file_id);
+        if (fileInfo.file_path) {
+          const mime = ctx.message.audio.mime_type || 'audio/mpeg';
+          const ext = this.mimeToExt(mime);
+          const url = `https://api.telegram.org/file/bot${this.botToken}/${fileInfo.file_path}`;
+          const buffer = await new Promise<Buffer>((resolve, reject) => {
+            https
+              .get(url, (res) => {
+                const chunks: Buffer[] = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+                res.on('error', reject);
+              })
+              .on('error', reject);
+          });
+          this.saveAudio(group, ctx.message.message_id.toString(), buffer, ext);
+          const transcript = await transcribeAudio(buffer, mime);
+          if (transcript) content = `[Audio: ${transcript}]`;
+        }
+      } catch (err: any) {
+        logger.error({ err: err.message }, 'Failed to transcribe audio file');
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeNonText(ctx, `[Document: ${name}]`);
